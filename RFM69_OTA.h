@@ -48,17 +48,25 @@
 #endif
 
 #include <RFM69.h>
+#ifdef NOSPIFlesh
+void CheckForWirelessHEX(RFM69 radio, uint8_t DEBUG=false, uint8_t LEDpin=LED);
+void HandleHandshakeACK(RFM69 radio, uint8_t flashCheck=true);
+uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, uint8_t DEBUG=false, uint8_t LEDpin=LED);
+#ifdef SHIFTCHANNEL
+uint8_t HandleWirelessHEXDataWrapper(RFM69 radio, uint8_t remoteID, uint8_t DEBUG=false, uint8_t LEDpin=LED);
+#endif
+#else
 #include <SPIFlash.h>
 
 //functions used in the REMOTE node
 void CheckForWirelessHEX(RFM69 radio, SPIFlash flash, uint8_t DEBUG=false, uint8_t LEDpin=LED);
 void HandleHandshakeACK(RFM69 radio, SPIFlash flash, uint8_t flashCheck=true);
-void resetUsingWatchdog(uint8_t DEBUG=false);
 uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uint8_t DEBUG=false, uint8_t LEDpin=LED);
-
 #ifdef SHIFTCHANNEL
 uint8_t HandleWirelessHEXDataWrapper(RFM69 radio, uint8_t remoteID, SPIFlash flash, uint8_t DEBUG=false, uint8_t LEDpin=LED);
 #endif
+#endif
+void resetUsingWatchdog(uint8_t DEBUG=false);
 
 //functions used in the MAIN node
 uint8_t CheckForSerialHEX(uint8_t* input, uint8_t inputLen, RFM69 radio, uint8_t targetID, uint16_t TIMEOUT=DEFAULT_TIMEOUT, uint16_t ACKTIMEOUT=ACK_TIMEOUT, uint8_t DEBUG=false);

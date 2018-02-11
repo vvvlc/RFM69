@@ -34,6 +34,104 @@
 #include <RFM69registers.h>
 #include <avr/wdt.h>
 
+/* DEBUG */
+#ifndef SerialX
+#define SerialX Serial
+#endif
+
+/*  local flash support */
+
+#include <avr/boot.h>
+
+typedef void (*do_spm_t)(uint16_t address, uint8_t command, uint16_t data);
+#define SLLOCJMP ((do_spm_t)(0x70ac>>1))
+const do_spm_t do_spm = SLLOCJMP;
+
+
+/*
+ * The same as do_spm but with disable/restore interrupts state
+ * required to succesfull SPM execution
+ */
+void do_spm_cli(uint16_t address, uint8_t command, uint16_t data) {
+  uint8_t sreg_save;
+
+  sreg_save = SREG;  // save old SREG value
+  asm volatile("cli");  // disable interrupts
+  do_spm(address,command,data);
+  SREG=sreg_save; // restore last interrupts state
+}
+
+
+/*
+ * Erase page in FLASH
+ */
+void __page_erase(uint16_t address) {
+  do_spm_cli(address,__BOOT_PAGE_ERASE,0);
+}
+
+
+/*
+ * Write word into temporary buffer
+ */
+void __page_fill(uint16_t address, uint16_t data) {
+  do_spm_cli(address,__BOOT_PAGE_FILL,data);
+}
+
+
+/*
+ * Write temporary buffer into FLASH
+ */
+void __page_write(uint16_t address) {
+  do_spm_cli(address,__BOOT_PAGE_WRITE,0);
+}
+
+
+
+#include <avr/pgmspace.h>
+
+
+
+const char flash_buffer[SPM_PAGESIZE] __attribute__ (( aligned(SPM_PAGESIZE) )) PROGMEM= {
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVW"
+};
+
+#define NEW_FLASH_OFFSET 0x3800
+uint8_t loByte;
+void writeByte(uint16_t address, char b) {
+	/*
+	 * effective address is NEW_FLAS_OFFSET (we want to write into Temp area)
+	 *  - 10  (SPI flash contains some metadata that we don't have to store in temp location, so we can skip it)
+	 */
+	address+=NEW_FLASH_OFFSET-10;
+	if (address % 16==0) {
+		//SerialX.println();
+		//SerialX.print(address,HEX);
+
+		if (address % SPM_PAGESIZE == 0) {
+			//SerialX.print('@');
+			__page_erase(address);
+		} else {
+			//SerialX.print(':');
+		}
+	}
+
+	//SerialX.print(' ');
+	//SerialX.print((uint8_t)b,HEX);
+
+	if (address % 2 == 0) {
+		loByte = b;
+	} else {
+		__page_fill (address-1, (b<<8)|loByte);
+	}
+
+	if (address % SPM_PAGESIZE == (SPM_PAGESIZE-1)) {
+
+		uint16_t page=address - (SPM_PAGESIZE-1);
+		//SerialX.print('*');
+		__page_write (page); // Store buffer in flash page.
+		//SerialX.print(page,HEX);
+	}
+}
 
 //===================================================================================================================
 // CheckForWirelessHEX() - Checks whether the last message received was a wireless programming request handshake
@@ -42,7 +140,11 @@
 // Assumes radio has been initialized and has just received a message (is not in SLEEP mode, and you called CRCPass())
 // Assumes flash is an external SPI flash memory chip that has been initialized
 //===================================================================================================================
+#ifdef NOSPIFlash
+void CheckForWirelessHEX(RFM69 radio, uint8_t DEBUG, uint8_t LEDpin)
+#else
 void CheckForWirelessHEX(RFM69 radio, SPIFlash flash, uint8_t DEBUG, uint8_t LEDpin)
+#endif
 {
   //special FLASH command, enter a FLASH image exchange sequence
   if (radio.DATALEN >= 4 && radio.DATA[0]=='F' && radio.DATA[1]=='L' && radio.DATA[2]=='X' && radio.DATA[3]=='?')
@@ -55,17 +157,23 @@ void CheckForWirelessHEX(RFM69 radio, SPIFlash flash, uint8_t DEBUG, uint8_t LED
 #ifdef SHIFTCHANNEL
     else if (HandleWirelessHEXDataWrapper(radio, remoteID, flash, DEBUG, LEDpin))
 #else
+#ifdef NOSPIFlash
+    else if (HandleWirelessHEXData(radio, remoteID, DEBUG, LEDpin))
+#else
     else if (HandleWirelessHEXData(radio, remoteID, flash, DEBUG, LEDpin))
 #endif
+#endif
     {
-      if (DEBUG) Serial.print(F("FLASH IMG TRANSMISSION SUCCESS!\n"));
+      //if (DEBUG) SerialX.print(F("FLASH IMG TRANSMISSION SUCCESS!\n"));
       resetUsingWatchdog(DEBUG);
     }
     else
     {
-      if (DEBUG) Serial.print("Timeout/Error, erasing written data ... ");
-      //flash.blockErase32K(0); //clear any written data in first 32K block
-      if (DEBUG) Serial.println(F("DONE"));
+      //if (DEBUG) SerialX.print("Timeout/Error, erasing written data ... ");
+#ifndef NOSPIFlash
+      flash.blockErase32K(0); //clear any written data in first 32K block
+#endif
+      //if (DEBUG) SerialX.println(F("DONE"));
     }
   }
 }
@@ -74,13 +182,17 @@ void CheckForWirelessHEX(RFM69 radio, SPIFlash flash, uint8_t DEBUG, uint8_t LED
 //===================================================================================================================
 // HandleHandshakeACK() - checks there is a FLASH chip and sends an ACK for the OTA request handshake
 //===================================================================================================================
+#ifdef NOSPIFlash
+void HandleHandshakeACK(RFM69 radio, uint8_t flashCheck) {
+#else
 void HandleHandshakeACK(RFM69 radio, SPIFlash flash, uint8_t flashCheck) {
+#endif
   if (flashCheck)
   {
     if (!flash.initialize())
     {
       radio.sendACK("FLX?NOK:NOFLASH",15); //NO FLASH CHIP FOUND, ABORTING
-      Serial.println(F("FAIL:NO FLASH MEM"));
+      SerialX.println(F("FAIL:NO FLASH MEM"));
       return;
     }
   }
@@ -93,12 +205,21 @@ void HandleHandshakeACK(RFM69 radio, SPIFlash flash, uint8_t flashCheck) {
 // that also shifts channel when SHIFTCHANNEL is defined
 //===================================================================================================================
 #ifdef SHIFTCHANNEL
+#ifdef NOSPIFlash
+uint8_t HandleWirelessHEXDataWrapper(RFM69 radio, uint8_t remoteID, uint8_t DEBUG, uint8_t LEDpin) {
+  HandleHandshakeACK(radio);
+#else
 uint8_t HandleWirelessHEXDataWrapper(RFM69 radio, uint8_t remoteID, SPIFlash flash, uint8_t DEBUG, uint8_t LEDpin) {
   HandleHandshakeACK(radio, flash);
-  if (DEBUG) { Serial.println(F("FLX?OK (ACK sent)")); Serial.print(F("Shifting channel to ")); Serial.println(radio.getFrequency() + SHIFTCHANNEL);}
+#endif
+  if (DEBUG) { SerialX.println(F("FLX?OK (ACK sent)")); SerialX.print(F("Shifting channel to ")); SerialX.println(radio.getFrequency() + SHIFTCHANNEL);}
   radio.setFrequency(radio.getFrequency() + SHIFTCHANNEL); //shift center freq by SHIFTCHANNEL amount
+#ifdef NOSPIFlash
+  uint8_t result = HandleWirelessHEXData(radio, remoteID, DEBUG, LEDpin);
+#else
   uint8_t result = HandleWirelessHEXData(radio, remoteID, flash, DEBUG, LEDpin);
-  if (DEBUG) { Serial.print(F("UNShifting channel to ")); Serial.println(radio.getFrequency() - SHIFTCHANNEL);}
+#endif
+  //if (DEBUG) { SerialX.print(F("UNShifting channel to ")); Serial.println(radio.getFrequency() - SHIFTCHANNEL);}
   radio.setFrequency(radio.getFrequency() - SHIFTCHANNEL); //restore center freq
   return result;
 }
@@ -109,21 +230,29 @@ uint8_t HandleWirelessHEXDataWrapper(RFM69 radio, uint8_t remoteID, SPIFlash fla
 // HandleWirelessHEXData() - ACKs the wireless programming handshake and handles
 // the complete transmission of the HEX image at the OTA programmed node side
 //===================================================================================================================
+#ifdef NOSPIFlash
+uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, uint8_t DEBUG, uint8_t LEDpin) {
+#else
 uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uint8_t DEBUG, uint8_t LEDpin) {
+#endif
   uint32_t now=0;
   uint16_t tmp,seq=0;
   char buffer[16];
   uint16_t timeout = 3000; //3s for flash data
   uint16_t bytesFlashed=10;
 #ifndef SHIFTCHANNEL
-  HandleHandshakeACK(radio, flash);
-  if (DEBUG) Serial.println(F("FLX?OK (ACK sent)"));
+#ifdef NOSPIFlash
+            HandleHandshakeACK(radio);
+#else
+            HandleHandshakeACK(radio, flash);
+#endif
+  //if (DEBUG) SerialX.println(F("FLX?OK (ACK sent)"));
 #endif
 
   //first clear the fist 32k block (dedicated to a new FLASH image)
-  flash.blockErase32K(0);
-  flash.writeBytes(0,"FLXIMG:", 7);
-  flash.writeByte(9,':');
+  //flash.blockErase32K(0);
+  //flash.writeBytes(0,"FLXIMG:", 7);
+  //flash.writeByte(9,':');
   now=millis();
     
   while(1)
@@ -153,12 +282,14 @@ uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uin
             index++;
           }
 
-          if (DEBUG) {
-            Serial.print(F("radio ["));
-            Serial.print(dataLen);
-            Serial.print(F("] > "));
+          /*
+
+           //if (DEBUG) {
+            SerialX.print(F("radio ["));
+            SerialX.print(dataLen);
+            SerialX.print(F("] > "));
             PrintHex83((uint8_t*)radio.DATA, dataLen);
-          }
+          }*/
 
           if (radio.DATA[++index] != ':') return false;
           now = millis(); //got "good" packet
@@ -170,14 +301,18 @@ uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uin
               seq++;
               for(uint8_t i=index;i<dataLen;i++)
               {
+#ifdef NOSPIFlash
+                writeByte(bytesFlashed++, radio.DATA[i]);
+#else
                 flash.writeByte(bytesFlashed++, radio.DATA[i]);
                 if (bytesFlashed%32768==0) flash.blockErase32K(bytesFlashed);//erase subsequent 32K blocks (possible in case of atmega1284p)
+#endif
               }
             }
 
             //send ACK
             tmp = sprintf(buffer, "FLX:%u:OK", tmp);
-            if (DEBUG) Serial.println((char*)buffer);
+            //if (DEBUG) SerialX.println((char*)buffer);
             radio.sendACK(buffer, tmp);
           }
         }
@@ -186,30 +321,40 @@ uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uin
         {
           if (dataLen==4) //ACK for handshake was lost, resend
           {
+#ifdef NOSPIFlash
+            HandleHandshakeACK(radio);
+#else
             HandleHandshakeACK(radio, flash);
-            if (DEBUG) Serial.println(F("FLX?OK resend"));
+#endif
+            //if (DEBUG) Serial.println(F("FLX?OK resend"));
           }
           if (dataLen==7 && radio.DATA[4]=='E' && radio.DATA[5]=='O' && radio.DATA[6]=='F') //Expected EOF
           {
 #ifdef __AVR_ATmega1284P__
             if ((bytesFlashed-10)>65526) { //max 65536 - 10 bytes (signature)
-              if (DEBUG) Serial.println(F("IMG > 64k, too big"));
+              //if (DEBUG) SerialX.println(F("IMG > 64k, too big"));
               radio.sendACK("FLX?NOK:HEX>64k",15);
               return false; //just return, let MAIN timeout
             }
 #else //assuming atmega328p
             if ((bytesFlashed-10)>31744) {
-              if (DEBUG) Serial.println(F("IMG > 31k, too big"));
+              //if (DEBUG) SerialX.println(F("IMG > 31k, too big"));
               radio.sendACK("FLX?NOK:HEX>31k",15);
               return false; //just return, let MAIN timeout
             }
 #endif
+#ifdef NOSPIFlash
+            HandleHandshakeACK(radio, false);
+#else
             HandleHandshakeACK(radio, flash, false);
-            if (DEBUG) Serial.println(F("FLX?OK"));
+#endif
+            //if (DEBUG) SerialX.println(F("FLX?OK"));
             //save # of bytes written
+#ifndef NOSPIFlash
             flash.writeByte(7,(bytesFlashed-10)>>8);
             flash.writeByte(8,(bytesFlashed-10));
             flash.writeByte(9,':');
+#endif
             return true;
           }
         }
@@ -237,7 +382,7 @@ uint8_t HandleWirelessHEXData(RFM69 radio, uint8_t remoteID, SPIFlash flash, uin
 uint8_t readSerialLine(char* input, char endOfLineChar, uint8_t maxLength, uint16_t timeout)
 {
   uint8_t inputLen = 0;
-  Serial.setTimeout(timeout);
+  SerialX.setTimeout(timeout);
   inputLen = Serial.readBytesUntil(endOfLineChar, input, maxLength);
   input[inputLen]=0;//null-terminate it
   Serial.setTimeout(0);
@@ -256,25 +401,25 @@ uint8_t CheckForSerialHEX(uint8_t* input, uint8_t inputLen, RFM69 radio, uint8_t
     {
       if (radio.DATALEN >= 7 && radio.DATA[4] == 'N')
       {
-        Serial.println((char*)radio.DATA); //signal serial handshake fail/error and return
+        SerialX.println((char*)radio.DATA); //signal serial handshake fail/error and return
         return false;
       }
       
-      Serial.println(F("\nFLX?OK")); //signal serial handshake back to host script
+      SerialX.println(F("\nFLX?OK")); //signal serial handshake back to host script
 #ifdef SHIFTCHANNEL
       if (HandleSerialHEXDataWrapper(radio, targetID, TIMEOUT, ACKTIMEOUT, DEBUG))
 #else
       if (HandleSerialHEXData(radio, targetID, TIMEOUT, ACKTIMEOUT, DEBUG))
 #endif
       {
-        Serial.println(F("FLX?OK")); //signal EOF serial handshake back to host script
-        if (DEBUG) Serial.println(F("FLASH IMG TRANSMISSION SUCCESS"));
+        SerialX.println(F("FLX?OK")); //signal EOF serial handshake back to host script
+        //if (DEBUG) SerialX.println(F("FLASH IMG TRANSMISSION SUCCESS"));
         return true;
       }
-      if (DEBUG) Serial.println(F("FLASH IMG TRANSMISSION FAIL"));
+      //if (DEBUG) SerialX.println(F("FLASH IMG TRANSMISSION FAIL"));
       return false;
     }
-    else Serial.println(F("FLX?NOK"));
+    else SerialX.println(F("FLX?NOK"));
   }
   return false;
 }
@@ -294,7 +439,7 @@ uint8_t HandleSerialHandshake(RFM69 radio, uint8_t targetID, uint8_t isEOF, uint
         return true;
   }
 
-  if (DEBUG) Serial.println(F("Handshake fail"));
+  //if (DEBUG) SerialX.println(F("Handshake fail"));
   return false;
 }
 
@@ -347,7 +492,7 @@ uint8_t HandleSerialHEXData(RFM69 radio, uint8_t targetID, uint16_t TIMEOUT, uin
             }
             index++;
           }
-          //Serial.print(F("input[index] = "));Serial.print(F("["));Serial.print(index);Serial.print(F("]="));Serial.println(input[index]);
+          //SerialX.print(F("input[index] = "));SerialX.print(F("["));SerialX.print(index);SerialX.print(F("]="));SerialX.println(input[index]);
           if (input[++index] != ':') return false;
           now = millis(); //got good packet
           index++;
@@ -358,19 +503,19 @@ uint8_t HandleSerialHEXData(RFM69 radio, uint8_t targetID, uint16_t TIMEOUT, uin
             if (tmp==seq) //only read data when packet number is the next expected SEQ number
             {
               uint8_t sendBufLen = prepareSendBuffer(input+index+8, sendBuf, hexDataLen, seq); //extract HEX data from input to BYTE data into sendBuf (go from 2 HEX bytes to 1 byte), +8 jumps over the header to the HEX raw data
-              //Serial.print(F("PREP "));Serial.print(sendBufLen); Serial.print(F(" > ")); PrintHex83(sendBuf, sendBufLen);
+              //SerialX.print(F("PREP "));SerialX.print(sendBufLen); SerialX.print(F(" > ")); PrintHex83(sendBuf, sendBufLen);
               
               //SEND RADIO DATA
               if (sendHEXPacket(radio, remoteID, sendBuf, sendBufLen, seq, TIMEOUT, ACKTIMEOUT, DEBUG))
               {
                 sprintf((char*)sendBuf, "FLX:%u:OK",seq);
-                Serial.println((char*)sendBuf); //response to host
+                SerialX.println((char*)sendBuf); //response to host
                 seq++;
               }
               else return false;
             }
           }
-          else Serial.println(F("FLX:INV"));
+          else SerialX.println(F("FLX:INV"));
         }
         if (inputLen==7 && input[3]=='?' && input[4]=='E' && input[5]=='O' && input[6]=='F')
         {
@@ -384,7 +529,7 @@ uint8_t HandleSerialHEXData(RFM69 radio, uint8_t targetID, uint16_t TIMEOUT, uin
 timeoutcheck:
     if (millis()-now > TIMEOUT)
     {
-      Serial.print(F("Timeout getting FLASH image from SERIAL, aborting.."));
+      //SerialX.print(F("Timeout getting FLASH image from SERIAL, aborting.."));
       //send abort msg or just let node timeout as well?
       return false;
     }
@@ -402,7 +547,7 @@ uint8_t validateHEXData(void* data, uint8_t length)
   //assuming 1 byte record length, 2 bytes address, 1 byte record type, N data bytes, 1 CRC byte
   char* input = (char*)data;
   if (length <12 || length%2!=0) return 0; //shortest possible intel data HEX record is 12 bytes
-  //Serial.print(F("VAL > ")); Serial.println((char*)input);
+  //SerialX.print(F("VAL > ")); SerialX.println((char*)input);
 
   uint8_t checksum=0;
   //check valid HEX data and CRC
@@ -416,8 +561,8 @@ uint8_t validateHEXData(void* data, uint8_t length)
   
   //TODO : CHECK for address continuity (intel HEX addresses are big endian)
   
-  //Serial.print(F("final CRC:"));Serial.println((uint8_t)checksum, HEX);
-  //Serial.print(F("CRC byte:"));Serial.println(BYTEfromHEX(input[length-2], input[length-1]), HEX);
+  //SerialX.print(F("final CRC:"));SerialX.println((uint8_t)checksum, HEX);
+  //SerialX.print(F("CRC byte:"));SerialX.println(BYTEfromHEX(input[length-2], input[length-1]), HEX);
 
   //check CHECKSUM byte
   if (((uint8_t)checksum) != BYTEfromHEX(input[length-2], input[length-1]))
@@ -461,12 +606,12 @@ uint8_t sendHEXPacket(RFM69 radio, uint8_t targetID, uint8_t* sendBuf, uint8_t h
   long now = millis();
   
   while(1) {
-    if (DEBUG) { Serial.print(F("RFTX > ")); PrintHex83(sendBuf, hexDataLen); }
+    //if (DEBUG) { SerialX.print(F("RFTX > ")); PrintHex83(sendBuf, hexDataLen); }
     if (radio.sendWithRetry(targetID, sendBuf, hexDataLen, 2, ACKTIMEOUT))
     {
       uint8_t ackLen = radio.DATALEN;
       
-      if (DEBUG) { Serial.print(F("RFACK > ")); Serial.print(ackLen); Serial.print(F(" > ")); PrintHex83((uint8_t*)radio.DATA, ackLen); }
+      //if (DEBUG) { SerialX.print(F("RFACK > ")); SerialX.print(ackLen); SerialX.print(F(" > ")); PrintHex83((uint8_t*)radio.DATA, ackLen); }
       
       if (ackLen >= 8 && radio.DATA[0]=='F' && radio.DATA[1]=='L' && radio.DATA[2]=='X' && 
           radio.DATA[3]==':' && radio.DATA[ackLen-3]==':' &&
@@ -480,7 +625,7 @@ uint8_t sendHEXPacket(RFM69 radio, uint8_t targetID, uint8_t* sendBuf, uint8_t h
 
     if (millis()-now > TIMEOUT)
     {
-      Serial.println(F("Timeout waiting for packet ACK, aborting FLASH operation ..."));
+      //SerialX.println(F("Timeout waiting for packet ACK, aborting FLASH operation ..."));
       break; //abort FLASH sequence if no valid ACK was received for a long time
     }
   }
@@ -509,7 +654,7 @@ void PrintHex83(uint8_t *data, uint8_t length)
     j++;
   }
   tmp[length*2] = 0;
-  Serial.println(tmp);
+  SerialX.println(tmp);
 }
 
 
@@ -519,7 +664,7 @@ void PrintHex83(uint8_t *data, uint8_t length)
 void resetUsingWatchdog(uint8_t DEBUG)
 {
   //wdt_disable();
-  if (DEBUG) Serial.print(F("REBOOTING"));
+  //if (DEBUG) SerialX.print(F("REBOOTING"));
   wdt_enable(WDTO_15MS);
-  while(1) if (DEBUG) Serial.print(F("."));
+  while(1);  //if (DEBUG) SerialX.print(F("."));
 }
